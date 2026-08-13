@@ -1,0 +1,46 @@
+# GHA / local FOFA egress: WARP SOCKS + Privoxy HTTP
+# Host:
+#   127.0.0.1:40000 → WARP SOCKS5 (gost)
+#   127.0.0.1:40080 → Privoxy HTTP → WARP
+services:
+  warp:
+    image: caomingjun/warp:latest
+    container_name: fofa-gha-warp
+    environment:
+      WARP_SLEEP: "2"
+      # optional: WARP_LICENSE_KEY
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    ports:
+      - "127.0.0.1:40000:1080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    restart: "no"
+
+  privoxy:
+    image: vimagick/privoxy:latest
+    container_name: fofa-gha-privoxy
+    depends_on:
+      warp:
+        condition: service_started
+    volumes:
+      - ./privoxy.conf:/etc/privoxy/config:ro
+    ports:
+      - "127.0.0.1:40080:8118"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: "no"

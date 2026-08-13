@@ -1,0 +1,157 @@
+name: turn-speed-rank
+
+# 同区 CF 优选 IP 作入口 + path global=1 实连测 TURN 速度（不压 DMIT 反代）
+# 最快 TURN 写入 R2 turn/turn_fast.json，供 source=turn-dmit 优先配对
+
+on:
+  schedule:
+    # 每 3 小时 UTC；对当前报告内全部可用 TURN 做实测
+    - cron: "32 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: "区（逗号）"
+        required: false
+        default: "SG,HK,JP,KR,US"
+      turn_candidates:
+        description: "每区最多测多少 TURN（0=全部）"
+        required: false
+        default: "0"
+      top:
+        description: "每区保留最快 N（0=全部）"
+        required: false
+        default: "0"
+      bytes:
+        description: "测速下载字节"
+        required: false
+        default: "1000000"
+      loss_probes:
+        description: "每节点丢包率探测次数"
+        required: false
+        default: "5"
+
+concurrency:
+  group: turn-speed-rank
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rank:
+    if: ${{ vars.ENABLE_SCHEDULED_RUNS == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      XUDP_HOST: ${{ secrets.XUDP_HOST }}
+      XUDP_UUID: ${{ secrets.XUDP_UUID }}
+      XHTTP_HOST: ${{ secrets.XHTTP_HOST }}
+      XHTTP_ENTRY: ${{ secrets.XHTTP_ENTRY }}
+      XHTTP_ENTRIES: ${{ secrets.XHTTP_ENTRIES }}
+      XHTTP_UUID: ${{ secrets.XHTTP_UUID }}
+      TURN_API: ${{ secrets.TURN_API }}
+      TURN_FAST_API: ${{ secrets.TURN_FAST_API }}
+      CF_IP_API: ${{ secrets.CF_IP_API }}
+      XUDP_ECH: ${{ secrets.XUDP_ECH }}
+      SPEED_URL: ${{ secrets.SPEED_URL }}
+      DELAY_URL: ${{ secrets.DELAY_URL }}
+      IP_META_BATCH_API: ${{ secrets.IP_META_BATCH_API }}
+      RELEASE_API_BASE: ${{ secrets.RELEASE_API_BASE }}
+      RELEASE_DOWNLOAD_BASE: ${{ secrets.RELEASE_DOWNLOAD_BASE }}
+      TURN_FAST_KEY: turn/turn_fast.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          pip install -q boto3 botocore
+          sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates
+
+      - name: Install mihomo
+        run: |
+          set -e
+          VER=$(curl -sS "${RELEASE_API_BASE}/repos/MetaCubeX/mihomo/releases/latest" | python3 -c "import sys,json;print(json.load(sys.stdin)['tag_name'])")
+          echo "mihomo $VER"
+          curl -sSL -o /tmp/mihomo.gz "${RELEASE_DOWNLOAD_BASE}/MetaCubeX/mihomo/releases/download/${VER}/mihomo-linux-amd64-${VER}.gz"
+          gunzip -c /tmp/mihomo.gz > /usr/local/bin/mihomo
+          chmod +x /usr/local/bin/mihomo
+          mihomo -v | head -1
+          echo "MIHOMO_BIN=/usr/local/bin/mihomo" >> "$GITHUB_ENV"
+
+      - name: Check R2
+        run: |
+          set -e
+          for k in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT R2_PUBLIC_BASE XUDP_HOST XUDP_UUID XHTTP_HOST XHTTP_ENTRY XHTTP_UUID TURN_API TURN_FAST_API CF_IP_API XUDP_ECH SPEED_URL DELAY_URL IP_META_BATCH_API RELEASE_API_BASE RELEASE_DOWNLOAD_BASE; do
+            [ -n "${!k}" ] || { echo "MISSING $k"; exit 1; }
+          done
+          echo "Required Secrets are present"
+
+      - name: Rank TURN (CF entry + global=1)
+        env:
+          REGIONS: ${{ github.event.inputs.regions || 'SG,HK,JP,KR,US' }}
+          CAND: ${{ github.event.inputs.turn_candidates || '0' }}
+          TOP: ${{ github.event.inputs.top || '0' }}
+          BYTES: ${{ github.event.inputs.bytes || '1000000' }}
+          LOSS_PROBES: ${{ github.event.inputs.loss_probes || '5' }}
+        run: |
+          set -e
+          export MIHOMO_BIN="${MIHOMO_BIN:-/usr/local/bin/mihomo}"
+          python3 scripts/turn_speed_rank.py \
+            --regions "$REGIONS" \
+            --cf-per-region 1 \
+            --turn-candidates "${CAND:-0}" \
+            --top "${TOP:-0}" \
+            --bytes "${BYTES:-1000000}" \
+            --loss-probes "${LOSS_PROBES:-5}" \
+            --global 1 \
+            --workdir "$RUNNER_TEMP/turn-speed" \
+            --out turn_fast.json
+
+      - name: Publish speed-sorted XHTTP subscription
+        if: always()
+        run: |
+          set -e
+          export XHTTP_ENTRY="${XHTTP_ENTRY:-$XHTTP_HOST}"
+          python3 scripts/turn_xhttp_sub.py
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## TURN speed rank (CF entry, global=1)"
+            echo ""
+            echo "- 入口: 同区 661 CF IP（**不用** DMIT 反代测速）"
+            echo "- path: \`/turn://IP:3478?ed=2560&global=1\`"
+            echo "- 产物: \`turn/turn_fast.json\` → turn-dmit 优先配对"
+            echo ""
+            if [ -f turn_fast.json ]; then
+              echo '```json'
+              python3 -c "import json;d=json.load(open('turn_fast.json'));print(json.dumps({k:d.get(k) for k in ('updated_at','counts','total','regions','note')},ensure_ascii=False,indent=2)[:4000])"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turn-fast
+          path: |
+            turn_fast.json
+            turn_xhttp_sub.txt
+            turn_xhttp_nodes.txt
+            turn_xhttp_manifest.json
+          if-no-files-found: ignore
+          retention-days: 14

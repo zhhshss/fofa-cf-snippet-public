@@ -1,0 +1,144 @@
+name: dmit-cf-proxy
+
+# 每日刷新 DMIT AS906 CF 反代 IP → R2 turn/dmit_ips.json
+# FOFA: server=="cloudflare" && port=="443" && header="Forbidden" && asn="906"
+# 测活: XUDP SNI TLS + /cdn-cgi/trace（重试）; 每区至少 1 个，不足则 FOFA 补扫
+
+on:
+  schedule:
+    # 每天 16:23 UTC（北京时间约 00:23），错开 turn-scan / fofa-refill
+    - cron: "23 16 * * *"
+  workflow_dispatch:
+    inputs:
+      min_per_region:
+        description: "每区至少可用数"
+        required: false
+        default: "1"
+      target_per_region:
+        description: "每区目标保留数"
+        required: false
+        default: "8"
+      force_fofa:
+        description: "强制每区 FOFA 再扫"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: dmit-cf-proxy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    if: ${{ vars.ENABLE_SCHEDULED_RUNS == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      FOFA_BASE: ${{ secrets.FOFA_BASE }}
+      FOFA_TOKEN: ${{ secrets.FOFA_TOKEN }}
+      XUDP_HOST: ${{ secrets.XUDP_HOST }}
+      DMIT_IPS_KEY: turn/dmit_ips.json
+      CF_EMAIL: ${{ secrets.CF_EMAIL }}
+      CF_API_KEY: ${{ secrets.CF_API_KEY }}
+      CF_ZONE: ${{ secrets.CF_ZONE }}
+      CF_ZONE_NAME: ${{ secrets.CF_ZONE_NAME }}
+      CFDM_HOST: ${{ secrets.CFDM_HOST }}
+      SUB_URL: ${{ secrets.SUB_URL }}
+      CF_TRACE_HOST: ${{ secrets.CF_TRACE_HOST }}
+      PROXY_CHECK_URL: ${{ secrets.PROXY_CHECK_URL }}
+      CF_API_BASE: ${{ secrets.CF_API_BASE }}
+      CF_TRACE_URL: ${{ secrets.CF_TRACE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -q boto3 botocore requests
+
+      - name: Check secrets
+        run: |
+          set -e
+          miss=0
+          for k in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT R2_PUBLIC_BASE FOFA_BASE FOFA_TOKEN XUDP_HOST CF_EMAIL CF_API_KEY CF_ZONE CF_ZONE_NAME CFDM_HOST SUB_URL CF_TRACE_HOST PROXY_CHECK_URL CF_API_BASE CF_TRACE_URL; do
+            if [ -z "${!k}" ]; then echo "MISSING: $k"; miss=1; fi
+          done
+          if [ "$miss" = "1" ]; then exit 1; fi
+          echo "Required Secrets are present"
+
+      - name: Refresh DMIT CF proxy pool
+        id: run
+        env:
+          MIN_PER: ${{ github.event.inputs.min_per_region || '1' }}
+          TARGET_PER: ${{ github.event.inputs.target_per_region || '8' }}
+          FORCE: ${{ github.event.inputs.force_fofa || 'false' }}
+        run: |
+          set +e
+          extra=""
+          if [ "$FORCE" = "true" ]; then extra="--force-fofa"; fi
+          python3 scripts/dmit_cf_proxy_refresh.py \
+            --min-per-region "${MIN_PER:-1}" \
+            --target-per-region "${TARGET_PER:-8}" \
+            --max-per-region 15 \
+            --retries 3 \
+            --timeout 4.5 \
+            --workers 20 \
+            --require-trace \
+            --ws-attempts 5 \
+            --ws-min-rate 0.8 \
+            --ws-max-p50-ms 1500 \
+            --out dmit_ips.json \
+            $extra
+          code=$?
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          if [ -f dmit_ips.json ]; then
+            echo "counts<<EOF" >> "$GITHUB_OUTPUT"
+            python3 -c "import json;d=json.load(open('dmit_ips.json'));print(json.dumps(d.get('counts'),ensure_ascii=False));print('total',d.get('total'))" >> "$GITHUB_OUTPUT"
+            echo "EOF" >> "$GITHUB_OUTPUT"
+          fi
+          # 0=全绿 2=有短区但已写入 1=失败
+          if [ "$code" = "1" ]; then exit 1; fi
+          exit 0
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## DMIT CF proxy refresh"
+            echo ""
+            echo "- FOFA: \`server==\"cloudflare\" && port==\"443\" && header=\"Forbidden\" && asn=\"906\"\`"
+            echo "- R2、订阅和 DNS 域名均由 Secrets 注入"
+            echo ""
+            if [ -f dmit_ips.json ]; then
+              echo '```json'
+              python3 -c "import json;d=json.load(open('dmit_ips.json'));print(json.dumps({k:d.get(k) for k in ('updated_at','counts','total','meta','regions')},ensure_ascii=False,indent=2)[:3500])"
+              echo '```'
+            else
+              echo "_no dmit_ips.json_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmit-cf-proxy
+          path: dmit_ips.json
+          if-no-files-found: ignore
+          retention-days: 14

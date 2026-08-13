@@ -1,0 +1,173 @@
+name: fofa-refill
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "maintain live account count"
+        required: false
+        default: "50"
+      register:
+        description: "force register N (0 = fill to target)"
+        required: false
+        default: "0"
+      workers:
+        description: "concurrency"
+        required: false
+        default: "3"
+      batch:
+        description: "register batch size"
+        required: false
+        default: "5"
+      skip_probe:
+        description: "skip login probe"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: fofa-refill
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refill:
+    if: ${{ vars.ENABLE_SCHEDULED_RUNS == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+      UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+      MAIL_BASE: ${{ secrets.MAIL_BASE }}
+      MAIL_ADMIN: ${{ secrets.MAIL_ADMIN }}
+      MAIL_DOMAIN: ${{ secrets.MAIL_DOMAIN }}
+      FOFA_PROXY: ${{ secrets.FOFA_PROXY }}
+      FOFA_PROXIES: ${{ secrets.FOFA_PROXIES }}
+      FOFA_TARGET: ${{ secrets.FOFA_TARGET }}
+      FOFA_WORKERS: ${{ secrets.FOFA_WORKERS }}
+      FOFA_BATCH: ${{ secrets.FOFA_BATCH }}
+      FOFA_AUTH_BASE: ${{ secrets.FOFA_AUTH_BASE }}
+      FOFA_WEB_ORIGIN: ${{ secrets.FOFA_WEB_ORIGIN }}
+      FOFA_WEB_REFERER: ${{ secrets.FOFA_WEB_REFERER }}
+      FOFA_PROBE_EMAIL: ${{ secrets.FOFA_PROBE_EMAIL }}
+      MAILTM_BASE: ${{ secrets.MAILTM_BASE }}
+      DOCKER_INSTALL_URL: ${{ secrets.DOCKER_INSTALL_URL }}
+      PUBLIC_IP_API: ${{ secrets.PUBLIC_IP_API }}
+      FOFA_ALLOW_DIRECT: "1"
+      FOFA_PROBE_SOFT: "1"
+      PYTHONUNBUFFERED: "1"
+      UPSTASH_TIMEOUT: "45"
+      UPSTASH_RETRIES: "5"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt
+
+      - name: Check secrets
+        run: |
+          set -e
+          miss=0
+          for k in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT R2_PUBLIC_BASE UPSTASH_REDIS_REST_URL UPSTASH_REDIS_REST_TOKEN MAIL_BASE MAIL_ADMIN MAIL_DOMAIN FOFA_AUTH_BASE FOFA_WEB_ORIGIN FOFA_WEB_REFERER FOFA_PROBE_EMAIL MAILTM_BASE DOCKER_INSTALL_URL PUBLIC_IP_API; do
+            if [ -z "${!k}" ]; then echo "MISSING secret/env: $k"; miss=1; fi
+          done
+          if [ "$miss" = "1" ]; then exit 1; fi
+          if [ -z "${FOFA_PROXY}" ]; then
+            echo "FOFA_PROXY empty — will start docker WARP (caomingjun/warp) + privoxy"
+          else
+            echo "FOFA_PROXY set (scheme=$(echo "$FOFA_PROXY" | cut -d: -f1))"
+          fi
+
+      - name: Ping Upstash + R2
+        run: |
+          set -e
+          ok=0
+          for i in 1 2 3; do
+            if python redis_store.py ping; then ok=1; break; fi
+            echo "upstash ping outer try $i failed; sleep $((i*5))"
+            sleep $((i*5))
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::Upstash PING failed after retries"
+            exit 1
+          fi
+          python -c "import r2_store; print('R2 objects:', r2_store.client().list_objects_v2(Bucket=r2_store.R2_BUCKET, MaxKeys=3).get('KeyCount'))"
+
+      - name: Setup containerized WARP (if no FOFA_PROXY)
+        if: ${{ env.FOFA_PROXY == '' }}
+        run: bash scripts/gha_setup_warp.sh
+
+      - name: Probe FOFA (proxy / WARP / DIRECT)
+        run: python scripts/gha_probe_fofa.py
+
+      - name: Maintain pool
+        id: maintain
+        env:
+          INPUT_TARGET: ${{ github.event.inputs.target }}
+          INPUT_REGISTER: ${{ github.event.inputs.register }}
+          INPUT_WORKERS: ${{ github.event.inputs.workers }}
+          INPUT_BATCH: ${{ github.event.inputs.batch }}
+          INPUT_SKIP: ${{ github.event.inputs.skip_probe }}
+        run: |
+          TARGET="${INPUT_TARGET:-${FOFA_TARGET:-50}}"
+          REGISTER="${INPUT_REGISTER:-0}"
+          WORKERS="${INPUT_WORKERS:-${FOFA_WORKERS:-3}}"
+          BATCH="${INPUT_BATCH:-${FOFA_BATCH:-5}}"
+          EXTRA=()
+          if [ "$INPUT_SKIP" = "true" ]; then EXTRA+=(--no-probe); fi
+          # FOFA 出口全挂时：不探测/不补号，只 rebuild 热池，避免红灯
+          if [ "${FOFA_EGRESS_OK:-1}" = "0" ] && [ "$REGISTER" = "0" ]; then
+            echo "::warning::FOFA egress blocked — rebuild pool only (no login probe / no register)"
+            EXTRA+=(--no-probe)
+            # force target-only path without registering by setting target to current if possible
+          fi
+          echo "target=$TARGET register=$REGISTER workers=$WORKERS batch=$BATCH FOFA_PROXY=${FOFA_PROXY:-<empty>} FOFA_EGRESS_OK=${FOFA_EGRESS_OK:-1}"
+          python maintain_pool.py \
+            --target "$TARGET" \
+            --register "$REGISTER" \
+            --workers "$WORKERS" \
+            --batch "$BATCH" \
+            --delay 2.0 \
+            --once \
+            --no-sync \
+            "${EXTRA[@]}" || {
+              rc=$?
+              if [ "${FOFA_EGRESS_OK:-1}" = "0" ]; then
+                echo "::warning::maintain exited $rc with FOFA blocked — try rebuild only"
+                python redis_store.py rebuild || true
+                python -c "import r2_store; print(r2_store.rebuild_pool().get('count'))" || true
+                exit 0
+              fi
+              exit $rc
+            }
+          python scripts/gha_quota_out.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fofa-refill-logs
+          path: |
+            /tmp/fofa_maintain_pool.log
+            maintain_pool.state.json
+            out/last_register.json
+          if-no-files-found: ignore

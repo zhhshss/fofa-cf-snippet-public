@@ -1,0 +1,194 @@
+name: turn-scan
+
+# 自动:FOFA 拉 TURN → 无鉴权/弱口令 → UDP/TCP 中继测活 → 写 R2 报告
+# 产物地址由 R2_PUBLIC_BASE Secret 注入。
+
+on:
+  schedule:
+    # 每 3 小时 UTC，先更新候选和测活报告；测速订阅在 :32 接着运行
+    - cron: "7 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      pages:
+        description: "FOFA 总页预算(优先 SG，再 JP/KR/HK/TW)"
+        required: false
+        default: "10"
+      size:
+        description: "每页条数(免费号≤50)"
+        required: false
+        default: "50"
+      concurrency:
+        description: "扫描并发"
+        required: false
+        default: "120"
+      query:
+        description: "覆盖主 FOFA 查询(空=默认 JP stun:3478)"
+        required: false
+        default: ""
+      days:
+        description: "FOFA 回溯天数"
+        required: false
+        default: "400"
+      window_days:
+        description: "FOFA 时间窗口天数"
+        required: false
+        default: "14"
+      limit:
+        description: "FOFA 候选上限"
+        required: false
+        default: "4000"
+
+concurrency:
+  group: turn-scan
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    if: ${{ vars.ENABLE_SCHEDULED_RUNS == 'true' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      R2_PUBLIC_BASE: ${{ secrets.R2_PUBLIC_BASE }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_PREFIX: turn/
+      FOFA_BASE: ${{ secrets.FOFA_BASE }}
+      FOFA_TOKEN: ${{ secrets.FOFA_TOKEN }}
+      XUDP_HOST: ${{ secrets.XUDP_HOST }}
+      XUDP_UUID: ${{ secrets.XUDP_UUID }}
+      XHTTP_HOST: ${{ secrets.XHTTP_HOST }}
+      XHTTP_ENTRY: ${{ secrets.XHTTP_ENTRY }}
+      XHTTP_ENTRIES: ${{ secrets.XHTTP_ENTRIES }}
+      XHTTP_UUID: ${{ secrets.XHTTP_UUID }}
+      TURN_API: ${{ secrets.TURN_API }}
+      TURN_FAST_API: ${{ secrets.TURN_FAST_API }}
+      XUDP_ECH: ${{ secrets.XUDP_ECH }}
+      TURN_VERIFY_HOST: ${{ secrets.TURN_VERIFY_HOST }}
+      TURN_VERIFY_PATH: ${{ secrets.TURN_VERIFY_PATH }}
+      TURN_VERIFY_PORT: ${{ secrets.TURN_VERIFY_PORT }}
+      TURN_DNS_IP: ${{ secrets.TURN_DNS_IP }}
+      IP_META_API: ${{ secrets.IP_META_API }}
+      FOFA_PAGES: ${{ github.event.inputs.pages || '10' }}
+      FOFA_SIZE: ${{ github.event.inputs.size || '50' }}
+      FOFA_DAYS: ${{ github.event.inputs.days || '400' }}
+      FOFA_WINDOW_DAYS: ${{ github.event.inputs.window_days || '14' }}
+      FOFA_LIMIT: ${{ github.event.inputs.limit || '4000' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Check R2 secrets
+        run: |
+          set -e
+          miss=0
+          for k in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET R2_ENDPOINT R2_PUBLIC_BASE FOFA_BASE FOFA_TOKEN XUDP_HOST XUDP_UUID XHTTP_HOST XHTTP_ENTRY XHTTP_UUID TURN_API TURN_FAST_API XUDP_ECH TURN_VERIFY_HOST TURN_VERIFY_PATH TURN_VERIFY_PORT TURN_DNS_IP IP_META_API; do
+            if [ -z "${!k}" ]; then echo "MISSING: $k"; miss=1; fi
+          done
+          if [ "$miss" = "1" ]; then exit 1; fi
+          echo "Required Secrets are present"
+
+      - name: Build
+        run: go build -o turn_scan turn_scan.go
+
+      - name: Bulk FOFA export (serial page1, eat web_data)
+        id: bulk
+        env:
+          FOFA_QUERY: ${{ github.event.inputs.query }}
+        run: |
+          set -e
+          # 本地 worker 串行细窗，不受 Snippet 单次子请求上限
+          if [ -n "$FOFA_QUERY" ]; then
+            python3 scripts/fofa_export_bulk.py -q "$FOFA_QUERY" \
+              --countries '' --days "${FOFA_DAYS:-400}" --window-days "${FOFA_WINDOW_DAYS:-14}" --limit "${FOFA_LIMIT:-4000}" \
+              -o turn_candidates.txt --json turn_candidates.json || true
+          else
+            python3 scripts/fofa_export_bulk.py --preset turn \
+              --countries SG,JP,KR,HK,TW --days "${FOFA_DAYS:-400}" --window-days "${FOFA_WINDOW_DAYS:-14}" --limit "${FOFA_LIMIT:-4000}" \
+              -o turn_candidates.txt --json turn_candidates.json || true
+          fi
+          n=$(wc -l < turn_candidates.txt 2>/dev/null || echo 0)
+          echo "candidates=$n"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          if [ "${n:-0}" -lt 1 ]; then
+            echo "bulk empty — will fall back to turn_scan -fofa"
+          fi
+
+      - name: Merge previously usable TURN candidates
+        run: |
+          set -e
+          python3 scripts/merge_turn_candidates.py \
+            --report "${R2_PUBLIC_BASE}/turn/turn_report.json" \
+            --input turn_candidates.txt \
+            --output turn_candidates.txt || echo "old report unavailable; continue with fresh candidates"
+
+      - name: Scan (候选 → 弱口令/匿名 → 中继测活 → R2)
+        env:
+          FOFA_QUERY: ${{ github.event.inputs.query }}
+          SCAN_C: ${{ github.event.inputs.concurrency || '100' }}
+        run: |
+          set -e
+          if [ -z "$FOFA_QUERY" ]; then unset FOFA_QUERY; fi
+          export R2_PREFIX="${R2_PREFIX:-turn/}"
+          if [ -s turn_candidates.txt ]; then
+            echo "scan from bulk candidates: $(wc -l < turn_candidates.txt) lines"
+            ./turn_scan -c "${SCAN_C:-120}" -p 400 -pt 3 -t 5 -ct 8 turn_candidates.txt
+          else
+            echo "fallback -fofa (export/search inside go)"
+            ./turn_scan -fofa -c "${SCAN_C:-120}" -p 400 -pt 3 -t 5 -ct 8
+          fi
+
+      - name: Build XHTTP subscription (scan fallback order)
+        run: |
+          set -e
+          export XHTTP_ENTRY="${XHTTP_ENTRY:-$XHTTP_HOST}"
+          python3 -m pip install -q boto3 botocore
+          python3 scripts/turn_xhttp_sub.py
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## TURN Scan"
+            echo ""
+            if [ -f turn_report.json ]; then
+              echo '```json'
+              head -c 4000 turn_report.json
+              echo
+              echo '```'
+            else
+              echo "_no report_"
+            fi
+            echo ""
+            echo "订阅已写入 Secret 指定的 R2 端点"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: turn-scan
+          path: |
+            turn_report.json
+            turn_sub.txt
+            turn_nodes.txt
+            turn_nodes_all.txt
+            turn_xhttp_sub.txt
+            turn_xhttp_nodes.txt
+            turn_xhttp_manifest.json
+            turn_results.txt
+            turn_candidates.txt
+            turn_candidates.json
+          if-no-files-found: ignore
+          retention-days: 14
