@@ -51,8 +51,6 @@ jobs:
       MAIL_BASE: ${{ secrets.MAIL_BASE }}
       MAIL_ADMIN: ${{ secrets.MAIL_ADMIN }}
       MAIL_DOMAIN: ${{ secrets.MAIL_DOMAIN }}
-      FOFA_PROXY: ${{ secrets.FOFA_PROXY }}
-      FOFA_PROXIES: ${{ secrets.FOFA_PROXIES }}
       FOFA_TARGET: ${{ secrets.FOFA_TARGET }}
       FOFA_WORKERS: ${{ secrets.FOFA_WORKERS }}
       FOFA_BATCH: ${{ secrets.FOFA_BATCH }}

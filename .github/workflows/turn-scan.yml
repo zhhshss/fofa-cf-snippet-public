@@ -64,7 +64,6 @@ jobs:
       XUDP_UUID: ${{ secrets.XUDP_UUID }}
       XHTTP_HOST: ${{ secrets.XHTTP_HOST }}
       XHTTP_ENTRY: ${{ secrets.XHTTP_ENTRY }}
-      XHTTP_ENTRIES: ${{ secrets.XHTTP_ENTRIES }}
       XHTTP_UUID: ${{ secrets.XHTTP_UUID }}
       TURN_API: ${{ secrets.TURN_API }}
       TURN_FAST_API: ${{ secrets.TURN_FAST_API }}
