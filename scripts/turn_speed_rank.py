@@ -518,6 +518,10 @@ def measure_ip_quality(
         )
         if completed.returncode:
             raise RuntimeError(completed.stderr.strip() or f"curl rc={completed.returncode}")
+        if not completed.stdout.strip():
+            raise RuntimeError(
+                f"empty response rc={completed.returncode} stderr={completed.stderr.strip()!r}"
+            )
         payload = json.loads(completed.stdout)
         score = payload.get("fraudScore")
         residential = payload.get("isResidential")
@@ -646,6 +650,12 @@ def measure_cf_control_index(
                     response_headers[header_name] = h_value.decode("latin1").strip()
             next_key = response_headers.get("x-k", "")
             if not next_key:
+                if not response_body.strip():
+                    raise RuntimeError(
+                        "empty gateway response "
+                        f"headers={sorted(response_headers)} "
+                        f"stderr={completed.stderr.decode('utf-8', errors='replace').strip()!r}"
+                    )
                 payload = json.loads(response_body.decode("utf-8"))
                 score = payload.get("risk_score")
                 if isinstance(score, bool) or not isinstance(score, (int, float)):
