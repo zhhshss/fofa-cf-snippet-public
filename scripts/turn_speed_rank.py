@@ -522,7 +522,13 @@ def measure_ip_quality(
             raise RuntimeError(
                 f"empty response rc={completed.returncode} stderr={completed.stderr.strip()!r}"
             )
-        payload = json.loads(completed.stdout)
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError as error:
+            preview = completed.stdout[:160].replace("\r", "\\r").replace("\n", "\\n")
+            raise RuntimeError(
+                f"invalid JSON bytes={len(completed.stdout.encode())} preview={preview!r}"
+            ) from error
         score = payload.get("fraudScore")
         residential = payload.get("isResidential")
         if isinstance(score, bool) or not isinstance(score, (int, float)):
@@ -656,7 +662,15 @@ def measure_cf_control_index(
                         f"headers={sorted(response_headers)} "
                         f"stderr={completed.stderr.decode('utf-8', errors='replace').strip()!r}"
                     )
-                payload = json.loads(response_body.decode("utf-8"))
+                response_text = response_body.decode("utf-8", errors="replace")
+                try:
+                    payload = json.loads(response_text)
+                except json.JSONDecodeError as error:
+                    preview = response_text[:160].replace("\r", "\\r").replace("\n", "\\n")
+                    raise RuntimeError(
+                        f"invalid gateway JSON bytes={len(response_body)} "
+                        f"preview={preview!r}"
+                    ) from error
                 score = payload.get("risk_score")
                 if isinstance(score, bool) or not isinstance(score, (int, float)):
                     score = None
