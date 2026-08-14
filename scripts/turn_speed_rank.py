@@ -40,6 +40,8 @@ if str(ROOT) not in sys.path:
 XUDP_HOST = os.environ.get("XUDP_HOST", "").strip()
 XUDP_UUID = os.environ.get("XUDP_UUID", "").strip()
 XUDP_ECH = os.environ.get("XUDP_ECH", "").strip()
+XHTTP_HOST = os.environ.get("XHTTP_HOST", "").strip()
+XHTTP_UUID = os.environ.get("XHTTP_UUID", "").strip()
 TURN_API = os.environ.get("TURN_API", "").strip()
 CF_IP_API = os.environ.get("CF_IP_API", "").strip()
 R2_KEY = os.environ.get("TURN_FAST_KEY", "turn/turn_fast.json")
@@ -54,9 +56,20 @@ IPPURE_CF_SUMMARY_URL = os.environ.get(
 IPPURE_CF_GATEWAY_URL = os.environ.get(
     "IPPURE_CF_GATEWAY_URL", "https://api.123169.xyz/api/gateway/cf"
 ).strip()
-if not all((XUDP_ECH, CF_IP_API, SPEED_URL, DELAY_URL, IP_META_BATCH_API)):
+if not all(
+    (
+        XUDP_ECH,
+        XHTTP_HOST,
+        XHTTP_UUID,
+        CF_IP_API,
+        SPEED_URL,
+        DELAY_URL,
+        IP_META_BATCH_API,
+    )
+):
     raise RuntimeError(
-        "XUDP_ECH, CF_IP_API, SPEED_URL, DELAY_URL and IP_META_BATCH_API are required"
+        "XUDP_ECH, XHTTP_HOST, XHTTP_UUID, CF_IP_API, SPEED_URL, DELAY_URL "
+        "and IP_META_BATCH_API are required"
     )
 
 # colo → 订阅区
@@ -270,6 +283,28 @@ def vless_node(
     return node
 
 
+def xhttp_node(source: dict[str, Any]) -> dict[str, Any]:
+    """复用同一入口与 TURN，仅把传输改成生产 XHTTP/stream-one。"""
+    return {
+        "name": source["name"],
+        "type": "vless",
+        "server": source["server"],
+        "port": source["port"],
+        "uuid": XHTTP_UUID,
+        "network": "xhttp",
+        "tls": True,
+        "udp": True,
+        "servername": XHTTP_HOST,
+        "client-fingerprint": "chrome",
+        "xhttp-opts": {
+            "path": source["ws-opts"]["path"].replace("/turn://", "/turn/"),
+            "host": XHTTP_HOST,
+            "mode": "stream-one",
+            "reuse-settings": {"h-keep-alive-period": 10},
+        },
+    }
+
+
 def write_mihomo_config(
     path: Path,
     nodes: list[dict[str, Any]],
@@ -300,10 +335,26 @@ def write_mihomo_config(
         lines.append(f"    servername: {n['servername']}")
         lines.append(f"    client-fingerprint: chrome")
         lines.append("    skip-cert-verify: true")
-        lines.append("    ws-opts:")
-        lines.append(f"      path: {json.dumps(n['ws-opts']['path'], ensure_ascii=False)}")
-        lines.append("      headers:")
-        lines.append(f"        Host: {n['ws-opts']['headers']['Host']}")
+        if n["network"] == "xhttp":
+            xhttp = n["xhttp-opts"]
+            lines.append("    alpn:")
+            lines.append('      - "h2"')
+            lines.append("    xhttp-opts:")
+            lines.append(f"      path: {json.dumps(xhttp['path'], ensure_ascii=False)}")
+            lines.append(f"      host: {xhttp['host']}")
+            lines.append(f"      mode: {xhttp['mode']}")
+            lines.append("      reuse-settings:")
+            lines.append(
+                "        h-keep-alive-period: "
+                f"{xhttp['reuse-settings']['h-keep-alive-period']}"
+            )
+        else:
+            lines.append("    ws-opts:")
+            lines.append(
+                f"      path: {json.dumps(n['ws-opts']['path'], ensure_ascii=False)}"
+            )
+            lines.append("      headers:")
+            lines.append(f"        Host: {n['ws-opts']['headers']['Host']}")
     # SELECT + url-test group
     names = [n["name"] for n in nodes]
     lines.append("proxy-groups:")
@@ -841,6 +892,16 @@ def main() -> int:
         log(f"[phase] IPPure quality for best nodes={len(best)}")
         for index, item in enumerate(best.values(), 1):
             name = str(item["name"])
+            ws_node = next(node for node in nodes if node["name"] == name)
+            # 质量站点经 TURN 的 WS 路由会返回空响应；改用线上同款 XHTTP。
+            # 速度/丢包仍沿用原 WS 实测，避免改变既有排序口径。
+            write_mihomo_config(
+                cfg_path,
+                [xhttp_node(ws_node)],
+                mixed_port=17890,
+                controller=19090,
+            )
+            api(19090, "/configs?force=true", method="PUT", timeout=10)
             item.update(measure_ip_quality(17890, 19090, name))
             item.update(measure_cf_control_index(17890, 19090, name))
             if index % 5 == 0 or index == 1:
