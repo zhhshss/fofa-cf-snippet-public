@@ -75,7 +75,7 @@ jobs:
 
       - name: Install deps
         run: |
-          pip install -q boto3 botocore
+          pip install -q boto3 botocore curl-cffi
           sudo apt-get update -qq && sudo apt-get install -y -qq curl ca-certificates
 
       - name: Install mihomo

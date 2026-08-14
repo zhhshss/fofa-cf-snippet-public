@@ -22,7 +22,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +31,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from curl_cffi import requests as curl_requests
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -497,37 +498,23 @@ def measure_ip_quality(
     try:
         body = json.dumps({"name": name}).encode()
         api(controller, "/proxies/PROXY", method="PUT", body=body, timeout=10)
-        completed = subprocess.run(
-            [
-                "curl",
-                "-sS",
-                "-x",
-                f"http://127.0.0.1:{mixed_port}",
-                "--max-time",
-                str(int(timeout)),
-                "-H",
-                "Accept: application/json",
-                "--tlsv1.2",
-                "--tls-max",
-                "1.2",
-                IPPURE_URL,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout + 5,
+        response = curl_requests.get(
+            IPPURE_URL,
+            headers={"Accept": "application/json"},
+            proxy=f"http://127.0.0.1:{mixed_port}",
+            timeout=timeout,
+            impersonate="chrome",
         )
-        if completed.returncode:
-            raise RuntimeError(completed.stderr.strip() or f"curl rc={completed.returncode}")
-        if not completed.stdout.strip():
-            raise RuntimeError(
-                f"empty response rc={completed.returncode} stderr={completed.stderr.strip()!r}"
-            )
+        response.raise_for_status()
+        response_text = response.text
+        if not response_text.strip():
+            raise RuntimeError(f"empty response status={response.status_code}")
         try:
-            payload = json.loads(completed.stdout)
+            payload = json.loads(response_text)
         except json.JSONDecodeError as error:
-            preview = completed.stdout[:160].replace("\r", "\\r").replace("\n", "\\n")
+            preview = response_text[:160].replace("\r", "\\r").replace("\n", "\\n")
             raise RuntimeError(
-                f"invalid JSON bytes={len(completed.stdout.encode())} preview={preview!r}"
+                f"invalid JSON bytes={len(response.content)} preview={preview!r}"
             ) from error
         score = payload.get("fraudScore")
         residential = payload.get("isResidential")
@@ -561,36 +548,21 @@ def measure_cf_control_index(
             body=json.dumps({"name": name}).encode(),
             timeout=10,
         )
-        raw = subprocess.run(
-            [
-                "curl",
-                "-sS",
-                "-x",
-                f"http://127.0.0.1:{mixed_port}",
-                "--max-time",
-                str(int(timeout)),
-                "--tlsv1.2",
-                "--tls-max",
-                "1.2",
-                IPPURE_CF_SUMMARY_URL,
-            ],
-            capture_output=True,
-            timeout=timeout + 5,
-            check=True,
-        ).stdout
+        proxy = f"http://127.0.0.1:{mixed_port}"
+        session = curl_requests.Session(impersonate="chrome", proxy=proxy)
+        summary_response = session.get(IPPURE_CF_SUMMARY_URL, timeout=timeout)
+        summary_response.raise_for_status()
+        raw = summary_response.content
         key = ""
         server_time = 0
         local_time = 0
         origin = "https://ippure.com"
         for _ in range(4):
-            headers = [
-                "-H",
-                "Content-Type: application/octet-stream",
-                "-H",
-                f"Origin: {origin}",
-                "-H",
-                "Referer: https://ippure.com/cloudflare",
-            ]
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Origin": origin,
+                "Referer": "https://ippure.com/cloudflare",
+            }
             body = raw
             if key:
                 timestamp = int(time.time() * 1000) - local_time + server_time
@@ -617,50 +589,22 @@ def measure_cf_control_index(
                     check=True,
                 ).stdout
                 body = iv + encrypted
-                headers += ["-H", f"x-k: {key}", "-H", f"x-t: {x_t}"]
-            with tempfile.NamedTemporaryFile() as header_file:
-                completed = subprocess.run(
-                    [
-                        "curl",
-                        "-sS",
-                        "-x",
-                        f"http://127.0.0.1:{mixed_port}",
-                        "--max-time",
-                        str(int(timeout)),
-                        "--tlsv1.2",
-                        "--tls-max",
-                        "1.2",
-                        "-D",
-                        header_file.name,
-                        "-X",
-                        "POST",
-                        *headers,
-                        "--data-binary",
-                        "@-",
-                        IPPURE_CF_GATEWAY_URL,
-                    ],
-                    input=body,
-                    capture_output=True,
-                    timeout=timeout + 5,
-                    check=True,
-                )
-                header_file.seek(0)
-                header_blob = header_file.read()
-            response_body = completed.stdout
-            response_headers: dict[str, str] = {}
-            # curl 经过代理时可能记录 CONNECT 与最终响应；同名头以最后一个为准。
-            for line in header_blob.splitlines():
-                if b":" in line:
-                    h_name, h_value = line.split(b":", 1)
-                    header_name = h_name.decode("latin1").strip().lower()
-                    response_headers[header_name] = h_value.decode("latin1").strip()
+                headers.update({"x-k": key, "x-t": x_t})
+            response = session.post(
+                IPPURE_CF_GATEWAY_URL,
+                headers=headers,
+                data=body,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            response_body = response.content
+            response_headers = {name.lower(): value for name, value in response.headers.items()}
             next_key = response_headers.get("x-k", "")
             if not next_key:
                 if not response_body.strip():
                     raise RuntimeError(
                         "empty gateway response "
-                        f"headers={sorted(response_headers)} "
-                        f"stderr={completed.stderr.decode('utf-8', errors='replace').strip()!r}"
+                        f"headers={sorted(response_headers)}"
                     )
                 response_text = response_body.decode("utf-8", errors="replace")
                 try:
