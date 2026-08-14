@@ -901,7 +901,14 @@ def main() -> int:
                 mixed_port=17890,
                 controller=19090,
             )
-            api(19090, "/configs?force=true", method="PUT", timeout=10)
+            reload_body = json.dumps({"path": str(cfg_path.resolve())}).encode()
+            api(
+                19090,
+                "/configs?force=true",
+                method="PUT",
+                body=reload_body,
+                timeout=10,
+            )
             item.update(measure_ip_quality(17890, 19090, name))
             item.update(measure_cf_control_index(17890, 19090, name))
             if index % 5 == 0 or index == 1:
