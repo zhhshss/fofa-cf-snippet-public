@@ -120,6 +120,15 @@ def node_remark(server: dict[str, Any], index: int, entry: str, entry_port: int)
     if exit_ip and exit_ip != ip:
         parts.append(f"E:{exit_ip}")
 
+    fraud_score = compact_number(server.get("fraudScore"))
+    residential = server.get("isResidential")
+    if fraud_score or isinstance(residential, bool):
+        residence = "R" if residential is True else "NR" if residential is False else "?"
+        parts.append(f"Q:F{fraud_score or '?'}/{residence}")
+    cf_control_index = compact_number(server.get("cfControlIndex"))
+    if cf_control_index:
+        parts.append(f"CFI:{cf_control_index}")
+
     measured: list[str] = []
     if tested_speed > 0:
         measured.append(f"{compact_number(tested_speed / 1024, 1)}M")
@@ -195,6 +204,9 @@ def rank_servers(report: dict[str, Any], fast: dict[str, Any]) -> list[dict[str,
             server["loss_success"] = speed.get("loss_success")
             server["test_cf_ip"] = str(speed.get("test_cf_ip") or "")
             server["test_cf_colo"] = str(speed.get("test_cf_colo") or "")
+            server["fraudScore"] = speed.get("fraudScore")
+            server["isResidential"] = speed.get("isResidential")
+            server["cfControlIndex"] = speed.get("cfControlIndex")
         rows.append(server)
 
     rows.sort(

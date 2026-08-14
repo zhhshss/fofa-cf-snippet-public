@@ -13,12 +13,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -43,6 +47,13 @@ SPEED_URL = os.environ.get("SPEED_URL", "").strip()
 # generate_204 做延迟兜底
 DELAY_URL = os.environ.get("DELAY_URL", "").strip()
 IP_META_BATCH_API = os.environ.get("IP_META_BATCH_API", "").strip()
+IPPURE_URL = os.environ.get("IPPURE_URL", "https://my.ippure.com/v1/info").strip()
+IPPURE_CF_SUMMARY_URL = os.environ.get(
+    "IPPURE_CF_SUMMARY_URL", "https://cf.999831.xyz/api/cf-summary"
+).strip()
+IPPURE_CF_GATEWAY_URL = os.environ.get(
+    "IPPURE_CF_GATEWAY_URL", "https://api.123169.xyz/api/gateway/cf"
+).strip()
 if not all((XUDP_ECH, CF_IP_API, SPEED_URL, DELAY_URL, IP_META_BATCH_API)):
     raise RuntimeError(
         "XUDP_ECH, CF_IP_API, SPEED_URL, DELAY_URL and IP_META_BATCH_API are required"
@@ -424,6 +435,174 @@ def measure_speed(
         return None, delay
 
 
+def measure_ip_quality(
+    mixed_port: int,
+    controller: int,
+    name: str,
+    *,
+    timeout: float = 15,
+) -> dict[str, Any]:
+    """经当前节点获取出口欺诈分和住宅属性；失败不影响主测速。"""
+    try:
+        body = json.dumps({"name": name}).encode()
+        api(controller, "/proxies/PROXY", method="PUT", body=body, timeout=10)
+        completed = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-x",
+                f"http://127.0.0.1:{mixed_port}",
+                "--max-time",
+                str(int(timeout)),
+                "-H",
+                "Accept: application/json",
+                IPPURE_URL,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+        if completed.returncode:
+            raise RuntimeError(completed.stderr.strip() or f"curl rc={completed.returncode}")
+        payload = json.loads(completed.stdout)
+        score = payload.get("fraudScore")
+        residential = payload.get("isResidential")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            score = None
+        if not isinstance(residential, bool):
+            residential = None
+        return {
+            "quality_ip": str(payload.get("ip") or ""),
+            "fraudScore": score,
+            "isResidential": residential,
+        }
+    except Exception as error:
+        log(f"  IPPure fail {name}: {error}")
+        return {"quality_ip": "", "fraudScore": None, "isResidential": None}
+
+
+def measure_cf_control_index(
+    mixed_port: int,
+    controller: int,
+    name: str,
+    *,
+    timeout: float = 20,
+) -> dict[str, Any]:
+    """经当前节点调用 IPPure Cloudflare Bot Management，获取封控指数。"""
+    try:
+        api(
+            controller,
+            "/proxies/PROXY",
+            method="PUT",
+            body=json.dumps({"name": name}).encode(),
+            timeout=10,
+        )
+        raw = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-x",
+                f"http://127.0.0.1:{mixed_port}",
+                "--max-time",
+                str(int(timeout)),
+                IPPURE_CF_SUMMARY_URL,
+            ],
+            capture_output=True,
+            timeout=timeout + 5,
+            check=True,
+        ).stdout
+        key = ""
+        server_time = 0
+        local_time = 0
+        origin = "https://ippure.com"
+        for _ in range(4):
+            headers = [
+                "-H",
+                "Content-Type: application/octet-stream",
+                "-H",
+                f"Origin: {origin}",
+                "-H",
+                "Referer: https://ippure.com/cloudflare",
+            ]
+            body = raw
+            if key:
+                timestamp = int(time.time() * 1000) - local_time + server_time
+                # 浏览器 Request.text() 会以 UTF-8 replacement 方式读取二进制正文。
+                # 签名必须复现该文本，再由 TextEncoder 编码，不能直接拼原始字节。
+                raw_text = raw.decode("utf-8", errors="replace")
+                signing = f"POST-{IPPURE_CF_GATEWAY_URL}-{raw_text}-{timestamp}".encode()
+                signature = hmac.new(key.encode(), signing, hashlib.sha256).hexdigest()
+                x_t = f"{timestamp}-{signature}"
+                iv = secrets.token_bytes(16)
+                encrypted = subprocess.run(
+                    [
+                        "openssl",
+                        "enc",
+                        "-aes-256-cbc",
+                        "-K",
+                        hashlib.sha256(x_t.encode()).hexdigest(),
+                        "-iv",
+                        iv.hex(),
+                    ],
+                    input=raw,
+                    capture_output=True,
+                    timeout=10,
+                    check=True,
+                ).stdout
+                body = iv + encrypted
+                headers += ["-H", f"x-k: {key}", "-H", f"x-t: {x_t}"]
+            with tempfile.NamedTemporaryFile() as header_file:
+                completed = subprocess.run(
+                    [
+                        "curl",
+                        "-sS",
+                        "-x",
+                        f"http://127.0.0.1:{mixed_port}",
+                        "--max-time",
+                        str(int(timeout)),
+                        "-D",
+                        header_file.name,
+                        "-X",
+                        "POST",
+                        *headers,
+                        "--data-binary",
+                        "@-",
+                        IPPURE_CF_GATEWAY_URL,
+                    ],
+                    input=body,
+                    capture_output=True,
+                    timeout=timeout + 5,
+                    check=True,
+                )
+                header_file.seek(0)
+                header_blob = header_file.read()
+            response_body = completed.stdout
+            response_headers: dict[str, str] = {}
+            # curl 经过代理时可能记录 CONNECT 与最终响应；同名头以最后一个为准。
+            for line in header_blob.splitlines():
+                if b":" in line:
+                    h_name, h_value = line.split(b":", 1)
+                    header_name = h_name.decode("latin1").strip().lower()
+                    response_headers[header_name] = h_value.decode("latin1").strip()
+            next_key = response_headers.get("x-k", "")
+            if not next_key:
+                payload = json.loads(response_body.decode("utf-8"))
+                score = payload.get("risk_score")
+                if isinstance(score, bool) or not isinstance(score, (int, float)):
+                    score = None
+                return {
+                    "cfControlIndex": score,
+                    "cfQualityIp": str(payload.get("ip") or ""),
+                }
+            key = next_key
+            server_time = int(response_headers.get("x-t") or int(time.time() * 1000))
+            local_time = int(time.time() * 1000)
+        raise RuntimeError("IPPure CF gateway handshake exceeded retries")
+    except Exception as error:
+        log(f"  IPPure CF fail {name}: {error}")
+        return {"cfControlIndex": None, "cfQualityIp": ""}
+
+
 def put_r2(key: str, obj: dict[str, Any]) -> None:
     from r2_store import put_json
 
@@ -658,6 +837,19 @@ def main() -> int:
                 if d1 < d0:
                     best[key] = m
 
+        # IPPure 两项检测以同一 TURN 的最佳实测入口为准，每个最终节点只请求一次。
+        log(f"[phase] IPPure quality for best nodes={len(best)}")
+        for index, item in enumerate(best.values(), 1):
+            name = str(item["name"])
+            item.update(measure_ip_quality(17890, 19090, name))
+            item.update(measure_cf_control_index(17890, 19090, name))
+            if index % 5 == 0 or index == 1:
+                log(
+                    f"  [{index}/{len(best)}] turn={item['turn_ip']} "
+                    f"fraud={item.get('fraudScore')} residential={item.get('isResidential')} "
+                    f"cf_index={item.get('cfControlIndex')}"
+                )
+
         by_reg: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for m in best.values():
             by_reg[m["region"]].append(m)
@@ -711,6 +903,11 @@ def main() -> int:
                     "country": x.get("country") or "",
                     "country_code": x.get("country_code") or "",
                     "city": x.get("city") or "",
+                    "quality_ip": x.get("quality_ip") or "",
+                    "fraudScore": x.get("fraudScore"),
+                    "isResidential": x.get("isResidential"),
+                    "cfControlIndex": x.get("cfControlIndex"),
+                    "cfQualityIp": x.get("cfQualityIp") or "",
                 }
                 for xs in by_reg.values()
                 for x in xs
