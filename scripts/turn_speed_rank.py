@@ -532,6 +532,25 @@ def measure_ip_quality(
         return {"quality_ip": "", "fraudScore": None, "isResidential": None}
 
 
+def validate_ip_quality(
+    result: dict[str, Any], expected_ip: str, name: str
+) -> dict[str, Any]:
+    """仅接受确实由当前 TURN 出口返回的 IPPure 质量结果。"""
+    actual_ip = str(result.get("quality_ip") or "").strip()
+    expected_ip = str(expected_ip or "").strip()
+    matched = bool(actual_ip and expected_ip and actual_ip == expected_ip)
+    result["qualityIpMatched"] = matched
+    if not matched:
+        if actual_ip:
+            log(
+                f"  IPPure exit mismatch {name}: "
+                f"expected={expected_ip or '?'} actual={actual_ip}"
+            )
+        result["fraudScore"] = None
+        result["isResidential"] = None
+    return result
+
+
 def measure_cf_control_index(
     mixed_port: int,
     controller: int,
@@ -721,6 +740,7 @@ def main() -> int:
                     "region": reg,
                     "turn_ip": tip,
                     "turn_port": tport,
+                    "exit_ip": str(turn.get("exit_ip") or tip),
                     "cred": cred,
                     "cf_ip": cf["ip"],
                     "cf_colo": cf["colo"],
@@ -886,7 +906,12 @@ def main() -> int:
                 body=reload_body,
                 timeout=10,
             )
-            item.update(measure_ip_quality(17890, 19090, name))
+            quality = measure_ip_quality(17890, 19090, name)
+            item.update(
+                validate_ip_quality(
+                    quality, str(item.get("exit_ip") or item["turn_ip"]), name
+                )
+            )
             item.update(measure_cf_control_index(17890, 19090, name))
             if index % 5 == 0 or index == 1:
                 log(
@@ -937,6 +962,7 @@ def main() -> int:
                     "region": x["region"],
                     "turn_ip": x["turn_ip"],
                     "turn_port": x["turn_port"],
+                    "exit_ip": x.get("exit_ip") or x["turn_ip"],
                     "cred": x.get("cred") or "",
                     "speed_kbs": x.get("speed_kbs"),
                     "delay_ms": x.get("delay_ms"),
@@ -949,6 +975,7 @@ def main() -> int:
                     "country_code": x.get("country_code") or "",
                     "city": x.get("city") or "",
                     "quality_ip": x.get("quality_ip") or "",
+                    "qualityIpMatched": x.get("qualityIpMatched") is True,
                     "fraudScore": x.get("fraudScore"),
                     "isResidential": x.get("isResidential"),
                     "cfControlIndex": x.get("cfControlIndex"),
