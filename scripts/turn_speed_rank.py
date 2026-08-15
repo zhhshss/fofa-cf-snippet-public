@@ -284,8 +284,19 @@ def vless_node(
     return node
 
 
-def xhttp_node(source: dict[str, Any]) -> dict[str, Any]:
+def xhttp_node(
+    source: dict[str, Any], *, global_mode: str | None = None
+) -> dict[str, Any]:
     """复用同一入口与 TURN，仅把传输改成生产 XHTTP/stream-one。"""
+    path = source["ws-opts"]["path"].replace("/turn://", "/turn/")
+    if global_mode is not None:
+        parsed = urllib.parse.urlsplit(path)
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        query = [(key, value) for key, value in query if key != "global"]
+        query.append(("global", global_mode))
+        path = urllib.parse.urlunsplit(
+            (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(query), parsed.fragment)
+        )
     return {
         "name": source["name"],
         "type": "vless",
@@ -298,7 +309,7 @@ def xhttp_node(source: dict[str, Any]) -> dict[str, Any]:
         "servername": XHTTP_HOST,
         "client-fingerprint": "chrome",
         "xhttp-opts": {
-            "path": source["ws-opts"]["path"].replace("/turn://", "/turn/"),
+            "path": path,
             "host": XHTTP_HOST,
             "mode": "stream-one",
             "reuse-settings": {"h-keep-alive-period": 10},
@@ -890,11 +901,12 @@ def main() -> int:
         for index, item in enumerate(best.values(), 1):
             name = str(item["name"])
             ws_node = next(node for node in nodes if node["name"] == name)
-            # 质量站点经 TURN 的 WS 路由会返回空响应；改用线上同款 XHTTP。
-            # 速度/丢包仍沿用原 WS 实测，避免改变既有排序口径。
+            # 质量站点使用生产 XHTTP，但 global=0 让非 CF TCP 由 Worker 直接
+            # 出口访问；这样 IPPure 看到的是该次 Worker 出口，不会把一个
+            # 共享 TURN/中间出口分数复制到所有 TURN 节点。
             write_mihomo_config(
                 cfg_path,
-                [xhttp_node(ws_node)],
+                [xhttp_node(ws_node, global_mode="0")],
                 mixed_port=17890,
                 controller=19090,
             )
@@ -907,11 +919,9 @@ def main() -> int:
                 timeout=10,
             )
             quality = measure_ip_quality(17890, 19090, name)
-            item.update(
-                validate_ip_quality(
-                    quality, str(item.get("exit_ip") or item["turn_ip"]), name
-                )
-            )
+            worker_exit = str(quality.get("quality_ip") or "")
+            item.update(validate_ip_quality(quality, worker_exit, name))
+            item["qualityRoute"] = "worker-direct" if worker_exit else ""
             item.update(measure_cf_control_index(17890, 19090, name))
             if index % 5 == 0 or index == 1:
                 log(
@@ -976,6 +986,7 @@ def main() -> int:
                     "city": x.get("city") or "",
                     "quality_ip": x.get("quality_ip") or "",
                     "qualityIpMatched": x.get("qualityIpMatched") is True,
+                    "qualityRoute": x.get("qualityRoute") or "",
                     "fraudScore": x.get("fraudScore"),
                     "isResidential": x.get("isResidential"),
                     "cfControlIndex": x.get("cfControlIndex"),

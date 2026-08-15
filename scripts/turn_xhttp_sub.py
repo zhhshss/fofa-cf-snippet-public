@@ -121,8 +121,15 @@ def node_remark(server: dict[str, Any], index: int, entry: str, entry_port: int)
         parts.append(f"E:{exit_ip}")
 
     quality_ip = text(server.get("quality_ip"))
+    quality_route = text(server.get("qualityRoute"))
     expected_quality_ip = text(server.get("exit_ip")) or ip
-    quality_matches = bool(quality_ip and quality_ip == expected_quality_ip)
+    quality_matches = bool(
+        quality_ip
+        and (
+            quality_route == "worker-direct"
+            or quality_ip == expected_quality_ip
+        )
+    )
     fraud_score = compact_number(server.get("fraudScore"))
     residential = server.get("isResidential")
     if quality_matches and (fraud_score or isinstance(residential, bool)):
