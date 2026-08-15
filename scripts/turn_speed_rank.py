@@ -50,7 +50,12 @@ SPEED_URL = os.environ.get("SPEED_URL", "").strip()
 # generate_204 做延迟兜底
 DELAY_URL = os.environ.get("DELAY_URL", "").strip()
 IP_META_BATCH_API = os.environ.get("IP_META_BATCH_API", "").strip()
-IPPURE_URL = os.environ.get("IPPURE_URL", "https://my.ippure.com/v1/info").strip()
+TURN_FAST_API = os.environ.get("TURN_FAST_API", "").strip()
+TURN_RISK_API = os.environ.get(
+    "TURN_RISK_API",
+    "https://proxycheck.io/v2/{ip}?vpn=1&asn=1&risk=1",
+).strip()
+QUALITY_TTL_HOURS = max(1, int(os.environ.get("QUALITY_TTL_HOURS", "24")))
 IPPURE_CF_SUMMARY_URL = os.environ.get(
     "IPPURE_CF_SUMMARY_URL", "https://cf.999831.xyz/api/cf-summary"
 ).strip()
@@ -498,68 +503,78 @@ def measure_speed(
         return None, delay
 
 
-def measure_ip_quality(
-    mixed_port: int,
-    controller: int,
-    name: str,
-    *,
-    timeout: float = 15,
-) -> dict[str, Any]:
-    """经当前节点获取出口欺诈分和住宅属性；失败不影响主测速。"""
+def fetch_cached_turn_quality() -> dict[str, dict[str, Any]]:
+    """读取上一轮按 TURN IP 查询的分数，避免每 3 小时重复消耗接口额度。"""
+    if not TURN_FAST_API:
+        return {}
     try:
-        body = json.dumps({"name": name}).encode()
-        api(controller, "/proxies/PROXY", method="PUT", body=body, timeout=10)
-        response = curl_requests.get(
-            IPPURE_URL,
-            headers={"Accept": "application/json"},
-            proxy=f"http://127.0.0.1:{mixed_port}",
-            timeout=timeout,
-            impersonate="chrome",
-        )
-        response.raise_for_status()
-        response_text = response.text
-        if not response_text.strip():
-            raise RuntimeError(f"empty response status={response.status_code}")
+        report = http_json(TURN_FAST_API)
+    except Exception as error:
+        log(f"[quality] previous report unavailable: {error}")
+        return {}
+
+    now = datetime.now(timezone.utc)
+    cached: dict[str, dict[str, Any]] = {}
+    for item in report.get("items") or []:
+        if not isinstance(item, dict) or item.get("qualitySource") != "proxycheck.io":
+            continue
+        ip = str(item.get("turn_ip") or "").strip()
+        updated_at = str(item.get("qualityUpdatedAt") or "").strip()
         try:
-            payload = json.loads(response_text)
-        except json.JSONDecodeError as error:
-            preview = response_text[:160].replace("\r", "\\r").replace("\n", "\\n")
-            raise RuntimeError(
-                f"invalid JSON bytes={len(response.content)} preview={preview!r}"
-            ) from error
-        score = payload.get("fraudScore")
-        residential = payload.get("isResidential")
+            updated = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            age_hours = (now - updated).total_seconds() / 3600
+        except (TypeError, ValueError):
+            continue
+        score = item.get("fraudScore")
+        if (
+            ip
+            and 0 <= age_hours < QUALITY_TTL_HOURS
+            and not isinstance(score, bool)
+            and isinstance(score, (int, float))
+        ):
+            cached[ip] = {
+                "quality_ip": ip,
+                "qualityIpMatched": True,
+                "qualityRoute": "ip-lookup",
+                "qualitySource": "proxycheck.io",
+                "qualityUpdatedAt": updated_at,
+                "fraudScore": score,
+                "qualityType": str(item.get("qualityType") or ""),
+            }
+    log(f"[quality] reusable={len(cached)} ttl={QUALITY_TTL_HOURS}h")
+    return cached
+
+
+def lookup_turn_quality(ip: str, *, timeout: float = 20) -> dict[str, Any]:
+    """直接查询指定 TURN IP 的风险分，结果天然与节点一一对应。"""
+    empty = {
+        "quality_ip": "",
+        "qualityIpMatched": False,
+        "qualityRoute": "ip-lookup",
+        "qualitySource": "proxycheck.io",
+        "qualityUpdatedAt": utc_now(),
+        "fraudScore": None,
+        "qualityType": "",
+    }
+    try:
+        url = TURN_RISK_API.format(ip=urllib.parse.quote(ip, safe=""))
+        payload = http_json(url, timeout=timeout)
+        record = payload.get(ip) if isinstance(payload, dict) else None
+        if payload.get("status") != "ok" or not isinstance(record, dict):
+            raise RuntimeError(f"unexpected response status={payload.get('status')!r}")
+        score = record.get("risk")
         if isinstance(score, bool) or not isinstance(score, (int, float)):
-            score = None
-        if not isinstance(residential, bool):
-            residential = None
+            raise RuntimeError(f"invalid risk score={score!r}")
         return {
-            "quality_ip": str(payload.get("ip") or ""),
+            **empty,
+            "quality_ip": ip,
+            "qualityIpMatched": True,
             "fraudScore": score,
-            "isResidential": residential,
+            "qualityType": str(record.get("type") or ""),
         }
     except Exception as error:
-        log(f"  IPPure fail {name}: {error}")
-        return {"quality_ip": "", "fraudScore": None, "isResidential": None}
-
-
-def validate_ip_quality(
-    result: dict[str, Any], expected_ip: str, name: str
-) -> dict[str, Any]:
-    """仅接受确实由当前 TURN 出口返回的 IPPure 质量结果。"""
-    actual_ip = str(result.get("quality_ip") or "").strip()
-    expected_ip = str(expected_ip or "").strip()
-    matched = bool(actual_ip and expected_ip and actual_ip == expected_ip)
-    result["qualityIpMatched"] = matched
-    if not matched:
-        if actual_ip:
-            log(
-                f"  IPPure exit mismatch {name}: "
-                f"expected={expected_ip or '?'} actual={actual_ip}"
-            )
-        result["fraudScore"] = None
-        result["isResidential"] = None
-    return result
+        log(f"  TURN risk lookup fail {ip}: {error}")
+        return empty
 
 
 def measure_cf_control_index(
@@ -896,14 +911,36 @@ def main() -> int:
                 if d1 < d0:
                     best[key] = m
 
-        # IPPure 两项检测以同一 TURN 的最佳实测入口为准，每个最终节点只请求一次。
-        log(f"[phase] IPPure quality for best nodes={len(best)}")
+        # 风险分必须按 TURN IP 查询，不能采用 Worker 或 GitHub Runner 的共享出口分。
+        cached_quality = fetch_cached_turn_quality()
+        quality_by_ip = dict(cached_quality)
+        missing_quality_ips = sorted(
+            {
+                str(item["turn_ip"])
+                for item in best.values()
+                if str(item["turn_ip"]) not in quality_by_ip
+            }
+        )
+        if missing_quality_ips:
+            with ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {
+                    executor.submit(lookup_turn_quality, ip): ip
+                    for ip in missing_quality_ips
+                }
+                for future in as_completed(futures):
+                    ip = futures[future]
+                    try:
+                        quality_by_ip[ip] = future.result()
+                    except Exception as error:
+                        log(f"  TURN risk lookup crashed {ip}: {error}")
+        log(f"[phase] per-TURN IP quality for best nodes={len(best)}")
         for index, item in enumerate(best.values(), 1):
             name = str(item["name"])
             ws_node = next(node for node in nodes if node["name"] == name)
-            # 质量站点使用生产 XHTTP，但 global=0 让非 CF TCP 由 Worker 直接
-            # 出口访问；这样 IPPure 看到的是该次 Worker 出口，不会把一个
-            # 共享 TURN/中间出口分数复制到所有 TURN 节点。
+            turn_ip = str(item["turn_ip"])
+            item.update(quality_by_ip[turn_ip])
+
+            # Cloudflare 封控指数仍需通过生产 XHTTP 链路检测。
             write_mihomo_config(
                 cfg_path,
                 [xhttp_node(ws_node, global_mode="0")],
@@ -918,15 +955,11 @@ def main() -> int:
                 body=reload_body,
                 timeout=10,
             )
-            quality = measure_ip_quality(17890, 19090, name)
-            worker_exit = str(quality.get("quality_ip") or "")
-            item.update(validate_ip_quality(quality, worker_exit, name))
-            item["qualityRoute"] = "worker-direct" if worker_exit else ""
             item.update(measure_cf_control_index(17890, 19090, name))
             if index % 5 == 0 or index == 1:
                 log(
                     f"  [{index}/{len(best)}] turn={item['turn_ip']} "
-                    f"fraud={item.get('fraudScore')} residential={item.get('isResidential')} "
+                    f"fraud={item.get('fraudScore')} type={item.get('qualityType')} "
                     f"cf_index={item.get('cfControlIndex')}"
                 )
 
@@ -987,8 +1020,10 @@ def main() -> int:
                     "quality_ip": x.get("quality_ip") or "",
                     "qualityIpMatched": x.get("qualityIpMatched") is True,
                     "qualityRoute": x.get("qualityRoute") or "",
+                    "qualitySource": x.get("qualitySource") or "",
+                    "qualityUpdatedAt": x.get("qualityUpdatedAt") or "",
                     "fraudScore": x.get("fraudScore"),
-                    "isResidential": x.get("isResidential"),
+                    "qualityType": x.get("qualityType") or "",
                     "cfControlIndex": x.get("cfControlIndex"),
                     "cfQualityIp": x.get("cfQualityIp") or "",
                 }

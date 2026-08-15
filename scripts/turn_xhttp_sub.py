@@ -121,21 +121,12 @@ def node_remark(server: dict[str, Any], index: int, entry: str, entry_port: int)
         parts.append(f"E:{exit_ip}")
 
     quality_ip = text(server.get("quality_ip"))
-    quality_route = text(server.get("qualityRoute"))
     expected_quality_ip = text(server.get("exit_ip")) or ip
-    quality_matches = bool(
-        quality_ip
-        and (
-            quality_route == "worker-direct"
-            or quality_ip == expected_quality_ip
-        )
-    )
+    quality_matches = bool(quality_ip and quality_ip == expected_quality_ip)
     fraud_score = compact_number(server.get("fraudScore"))
-    residential = server.get("isResidential")
-    if quality_matches and (fraud_score or isinstance(residential, bool)):
-        residence = "R" if residential is True else "NR" if residential is False else "?"
-        parts.append(f"Q:F{fraud_score or '?'}/{residence}")
-    elif quality_ip or fraud_score or isinstance(residential, bool):
+    if quality_matches and fraud_score:
+        parts.append(f"Q:F{fraud_score}")
+    elif quality_ip or fraud_score:
         parts.append("Q:?")
     cf_control_index = compact_number(server.get("cfControlIndex"))
     if cf_control_index:
@@ -218,8 +209,11 @@ def rank_servers(report: dict[str, Any], fast: dict[str, Any]) -> list[dict[str,
             server["test_cf_colo"] = str(speed.get("test_cf_colo") or "")
             server["quality_ip"] = str(speed.get("quality_ip") or "")
             server["qualityIpMatched"] = speed.get("qualityIpMatched") is True
+            server["qualityRoute"] = str(speed.get("qualityRoute") or "")
+            server["qualitySource"] = str(speed.get("qualitySource") or "")
+            server["qualityUpdatedAt"] = str(speed.get("qualityUpdatedAt") or "")
             server["fraudScore"] = speed.get("fraudScore")
-            server["isResidential"] = speed.get("isResidential")
+            server["qualityType"] = str(speed.get("qualityType") or "")
             server["cfControlIndex"] = speed.get("cfControlIndex")
         rows.append(server)
 
