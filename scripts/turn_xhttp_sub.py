@@ -124,7 +124,7 @@ def node_remark(server: dict[str, Any], index: int, entry: str, entry_port: int)
     expected_quality_ip = text(server.get("exit_ip")) or ip
     quality_matches = bool(quality_ip and quality_ip == expected_quality_ip)
     fraud_score = compact_number(server.get("fraudScore"))
-    if quality_matches and fraud_score:
+    if quality_matches and fraud_score != "":
         parts.append(f"Q:F{fraud_score}")
     elif quality_ip or fraud_score:
         parts.append("Q:?")
